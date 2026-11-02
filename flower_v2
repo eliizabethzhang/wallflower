@@ -1,0 +1,889 @@
+// Shy Flower v2
+// Opens and sings Pachelbel's Canon when it's calm. Closes only when someone
+// approaches fast enough; simple closeness alone does not close it.
+// Bee detection has priority: a bee forces it open, plays the bee tune, and
+// temporarily blocks closing. If already open, the flower does a happy wiggle.
+// Stays closed >= 5 s, then PEEKS out before fully opening again.
+//
+// New in v2:
+//  - Confidence: starts quiet/short, gets bolder while a person stays calm nearby,
+//    fades back to timid if left alone.
+//  - Sings in phrases (a few notes/bars at a time) and resumes where it left off.
+//  - Peeking after hiding.
+//  - Close speed depends on how scary the approach was.
+//  - Light-only happy song (photoresistor on A1).
+//  - Emotion sounds: scared squeak, worried "uh-oh", happy chirp, hello chirp,
+//    peek "hm?", bee trill, sleepy sigh.
+//  - Bee landing detection on copper tape (D7).
+// Button on pin 5 = "the end": melody stops, flower slowly closes and sleeps.
+// Press again to wake it up.
+
+#include <Servo.h>
+
+// ---------------- Pins ----------------
+const int SERVO_PIN  = 2;
+const int BUZZER_PIN = 8;
+const int LIGHT_PIN  = A2;   // ambient light: helps coax it out of hiding
+const int LIGHT2_PIN = A1;   // "sun" sensor: triggers the happy light-only song
+const int TRIG_PIN   = 3;
+const int ECHO_PIN   = 4;
+const int BUTTON_PIN = 5;    // wired to GND when pressed (INPUT_PULLUP)
+const int BEE_PIN    = 7;    // D7: copper tape wire
+
+// ---------------- Tuning ----------------
+// Servo
+// Servo is driven by pulse width in microseconds. Open is the SMALLER pulse.
+const int OPEN_US   = 950;
+const int CLOSED_US = 1400;
+// Logical positions (0 = closed, 160 = open). All the step timings and peek
+// positions below are in these units; they're mapped to microseconds on write.
+const int CLOSED_POS = 0;
+const int OPEN_POS   = 160;
+const int OPEN_STEP_MS  = 40;   // ms per degree while opening (bigger = slower)
+const int CLOSE_STEP_MS = 25;   // default close speed (ms per degree)
+const int SLEEP_CLOSE_STEP_MS = 50;  // slow close for "the end"
+
+// Shyness
+const unsigned long MIN_CLOSED_MS = 5000;  // stay closed at least this long
+const float FAST_APPROACH_CM_S = 50.0;     // faster than this = startle
+const float MILD_APPROACH_CM_S = 35.0;     // between this and FAST = mild worry
+const float SCARE_RANGE_CM     = 150.0;    // startle only within this range
+const float WORRY_RANGE_CM     = 100.0;    // mild worry only within this range
+const float SAFE_DISTANCE_CM   = 60.0;     // backed away this far = ok to reopen
+const float CALM_SPEED_CM_S    = 30.0;     // must be moving slower than this to reopen
+
+// Close speed vs. scariness (ms per degree; smaller = faster)
+const int   MILD_CLOSE_STEP_MS    = 70;    // barely worried: closes slowly
+const int   NORMAL_CLOSE_STEP_MS  = 25;    // right at the startle threshold
+const int   PANIC_CLOSE_STEP_MS   = 4;     // very fast approach: slams shut
+const float PANIC_APPROACH_CM_S   = 150.0; // speed at which it's full panic
+
+// Peeking
+const int PEEK_POS[] = {            // open a bit, close, open more, close a bit, open lots
+  CLOSED_POS + 12, CLOSED_POS, CLOSED_POS + 35, CLOSED_POS + 8, CLOSED_POS + 70
+};
+const int PEEK_COUNT = sizeof(PEEK_POS) / sizeof(PEEK_POS[0]);
+const unsigned long PEEK_PAUSE_MS = 1200;  // look around at each step
+const int PEEK_OPEN_STEP_MS  = 60;
+const int PEEK_CLOSE_STEP_MS = 45;
+
+// Confidence (0.1 = timid, 1.0 = bold)
+const float CONF_MIN = 0.10;
+const float CONF_START = 0.35;
+const float CONF_RISE_PER_S = 0.04;        // rises while a person stays calm nearby
+const float CONF_FALL_PER_S = 0.015;       // falls while left alone
+const unsigned long ALONE_GRACE_MS = 20000; // alone this long before it starts to fade
+const float CONF_PROUD = 0.6;              // happy chirp when it crosses this
+
+// Singing in phrases
+const int   PHRASE_NOTES_MIN = 3;          // notes per burst when timid
+const int   PHRASE_NOTES_MAX = 17;         // notes per burst when bold
+const unsigned long GAP_TIMID_MS = 3000;   // pause between bursts when timid
+const unsigned long GAP_BOLD_MS  = 400;    // pause between bursts when bold
+const float ARTIC_TIMID = 0.35;            // fraction of note sounded (shorter = "softer")
+const float ARTIC_BOLD  = 0.80;
+const int   RESUME_BACKUP_NOTES = 2;       // after a scare, replay this many notes
+const int   octaveMultiplier = 2;          // 1 = original pitch, 2 = up one octave
+const bool  LOOP_MELODY = true;            // replay after a pause
+const unsigned long LOOP_PAUSE_MS = 3000;
+
+// Hello chirp (invite visitors in)
+const float HELLO_MAX_CM = 160.0;
+const float HELLO_STILL_CM_S = 10.0;       // "standing still"
+const unsigned long HELLO_AFTER_MS = 2000; // still for this long -> chirp
+const unsigned long HELLO_COOLDOWN_MS = 25000;
+
+// Light (ESP32 ADC is 0-4095). Flip the comparisons if your photoresistors
+// read LOWER when bright.
+const int LIGHT_THRESHOLD  = 100;   // A2: reopen from hiding
+const int LIGHT2_THRESHOLD = 100;   // A1: happy light-only song
+
+// Bee detection on D7
+//  1 = capacitive touch (ESP32 touchRead) on a single copper tape wire
+//  0 = digital: bee bridges the wire to GND, pin reads LOW
+#define BEE_USE_TOUCH 0
+const float BEE_TOUCH_FRACTION = 0.15;     // reading changes >15% from baseline = touched
+const int   BEE_HITS_NEEDED = 2;           // consecutive 50 ms samples
+const unsigned long BEE_COOLDOWN_MS = 1500;  // short debounce so repeated bee visits still react
+
+// Bee behavior: bee reactions temporarily override the motion/shyness logic.
+// This prevents a nearby person / ultrasonic reading from immediately closing
+// the flower again after a bee arrives.
+const unsigned long BEE_PROTECT_MS = 5000;
+const unsigned long LIGHT_PROTECT_MS = 5000;   // bright light also forces a protected wake
+const unsigned long WAKE_SETTLE_MS = 2500;     // ignore ultrasonic motion just after any wake
+const int BEE_WIGGLE_AMOUNT = 18;      // how far to dip from fully open
+const int BEE_WIGGLE_COUNT  = 3;       // number of happy dips
+const int BEE_WIGGLE_STEP_MS = 12;     // fast, cheerful movement
+
+// Bee + sun celebration: bigger/faster wiggle and a unique little song.
+const int BEE_SUN_WIGGLE_AMOUNT = 28;
+const int BEE_SUN_WIGGLE_COUNT  = 5;
+const int BEE_SUN_WIGGLE_STEP_MS = 9;
+const unsigned long BEE_SUN_PROTECT_MS = 7000;
+
+// Ultrasonic
+const unsigned long ECHO_TIMEOUT_US = 25000;
+const float MAX_CM = 300.0;
+const unsigned long DIST_INTERVAL_MS = 100;  // read distance every 100 ms
+
+// ---------------- Notes ----------------
+#define NOTE_D3  147
+#define NOTE_E3  165
+#define NOTE_FS3 185
+#define NOTE_G3  196
+#define NOTE_A3  220
+#define NOTE_B3  247
+#define NOTE_CS4 277
+#define NOTE_D4  294
+#define NOTE_E4  330
+#define NOTE_FS4 370
+#define NOTE_G4  392
+#define NOTE_A4  440
+
+// Pairs of (frequency, divider). Negative divider = dotted.
+const int canonMelody[] = {
+ // Cannon in D - Pachelbel
+ NOTE_FS4,2, NOTE_E4,2,
+ NOTE_D4,2, NOTE_CS4,2,
+ NOTE_B3,2, NOTE_A3,2,
+ NOTE_B3,2, NOTE_CS4,2,
+ NOTE_FS4,2, NOTE_E4,2,
+ NOTE_D4,2, NOTE_CS4,2,
+ NOTE_B3,2, NOTE_A3,2,
+ NOTE_B3,2, NOTE_CS4,2,
+ NOTE_D4,2, NOTE_CS4,2,
+ NOTE_B3,2, NOTE_A3,2,
+ NOTE_G3,2, NOTE_FS3,2,
+ NOTE_G3,2, NOTE_A3,2,
+
+ NOTE_D4,4, NOTE_FS4,8, NOTE_G4,8, NOTE_A4,4, NOTE_FS4,8, NOTE_G4,8,
+ NOTE_A4,4, NOTE_B3,8, NOTE_CS4,8, NOTE_D4,8, NOTE_E4,8, NOTE_FS4,8, NOTE_G4,8,
+ NOTE_FS4,4, NOTE_D4,8, NOTE_E4,8, NOTE_FS4,4, NOTE_FS3,8, NOTE_G3,8,
+ NOTE_A3,8, NOTE_G3,8, NOTE_FS3,8, NOTE_G3,8, NOTE_A3,2,
+ NOTE_G3,4, NOTE_B3,8, NOTE_A3,8, NOTE_G3,4, NOTE_FS3,8, NOTE_E3,8,
+ NOTE_FS3,4, NOTE_D3,8, NOTE_E3,8, NOTE_FS3,8, NOTE_G3,8, NOTE_A3,8, NOTE_B3,8,
+
+ NOTE_G3,4, NOTE_B3,8, NOTE_A3,8, NOTE_B3,4, NOTE_CS4,8, NOTE_D4,8,
+ NOTE_A3,8, NOTE_B3,8, NOTE_CS4,8, NOTE_D4,8, NOTE_E4,8, NOTE_FS4,8, NOTE_G4,8, NOTE_A4,2,
+ NOTE_A4,4, NOTE_FS4,8, NOTE_G4,8, NOTE_A4,4,
+ NOTE_FS4,8, NOTE_G4,8, NOTE_A4,8, NOTE_A3,8, NOTE_B3,8, NOTE_CS4,8,
+ NOTE_D4,8, NOTE_E4,8, NOTE_FS4,8, NOTE_G4,8, NOTE_FS4,4, NOTE_D4,8, NOTE_E4,8,
+ NOTE_FS4,8, NOTE_CS4,8, NOTE_A3,8, NOTE_A3,8,
+
+ NOTE_CS4,4, NOTE_B3,4, NOTE_D4,8, NOTE_CS4,8, NOTE_B3,4,
+ NOTE_A3,8, NOTE_G3,8, NOTE_A3,4, NOTE_D3,8, NOTE_E3,8, NOTE_FS3,8, NOTE_G3,8,
+ NOTE_A3,8, NOTE_B3,4, NOTE_G3,4, NOTE_B3,8, NOTE_A3,8, NOTE_B3,4,
+ NOTE_CS4,8, NOTE_D4,8, NOTE_A3,8, NOTE_B3,8, NOTE_CS4,8, NOTE_D4,8, NOTE_E4,8,
+ NOTE_FS4,8, NOTE_G4,8, NOTE_A4,2,
+};
+
+// Light-only song: "Ode to Joy" (public domain), in D, played faster
+const int sunMelody[] = {
+ NOTE_FS4,4, NOTE_FS4,4, NOTE_G4,4, NOTE_A4,4,
+ NOTE_A4,4,  NOTE_G4,4,  NOTE_FS4,4, NOTE_E4,4,
+ NOTE_D4,4,  NOTE_D4,4,  NOTE_E4,4,  NOTE_FS4,4,
+ NOTE_FS4,-4, NOTE_E4,8, NOTE_E4,2,
+
+ NOTE_FS4,4, NOTE_FS4,4, NOTE_G4,4, NOTE_A4,4,
+ NOTE_A4,4,  NOTE_G4,4,  NOTE_FS4,4, NOTE_E4,4,
+ NOTE_D4,4,  NOTE_D4,4,  NOTE_E4,4,  NOTE_FS4,4,
+ NOTE_E4,-4, NOTE_D4,8, NOTE_D4,2,
+};
+
+struct Song {
+  const int* data;
+  int count;            // number of notes
+  unsigned long whole;  // ms per whole note
+  int idx;              // current position (index into data, step 2) - remembered between phrases
+};
+
+Song canon = { canonMelody, sizeof(canonMelody) / sizeof(canonMelody[0]) / 2, (60000UL * 4) / 150, 0 };
+Song sun   = { sunMelody,   sizeof(sunMelody)   / sizeof(sunMelody[0])   / 2, (60000UL * 4) / 220, 0 };
+Song* active = &canon;
+
+// ---------------- Emotion sounds: (frequency Hz, duration ms), 0 Hz = rest ----------------
+const int SFX_SQUEAK[] = {1900,30, 1700,30, 1500,30, 1300,30, 1100,30, 900,40, 700,60};  // startled
+const int SFX_WORRY[]  = {700,70, 560,110};                                                // uh-oh
+const int SFX_CHIRP[]  = {800,40, 1000,40, 1250,40, 1600,80};                              // happy
+const int SFX_HELLO[]  = {1200,70, 0,50, 1600,100};                                        // come closer
+const int SFX_PEEK[]   = {500,60, 0,30, 650,90};                                           // hm?
+const int SFX_BEE[]    = {1500,30, 1900,30, 1500,30, 1900,30, 1500,30, 1900,30, 2300,70};  // bee trill
+// Special bee + sun celebration melody (bright ascending/descending motif).
+const int SFX_BEE_SUN[] = {
+  988,120, 1319,120, 1568,140, 1976,180,
+  1568,110, 1760,110, 1976,110, 2349,220,
+  1976,100, 1568,100, 1319,100, 1568,220
+};
+const int SFX_SLEEP[]  = {900,140, 750,140, 600,160, 450,260};                             // sleepy sigh
+#define PLAY_SFX(arr) startSfx(arr, sizeof(arr) / sizeof(arr[0]) / 2)
+
+// ---------------- State ----------------
+enum State { AWAKE, HIDING, PEEKING, SLEEPING };
+State state = AWAKE;
+
+Servo flower;
+int servoPos = CLOSED_POS;
+int servoTarget = CLOSED_POS;
+int openStepMs = OPEN_STEP_MS;
+int closeStepMs = CLOSE_STEP_MS;
+unsigned long lastServoStep = 0;
+
+// melody playback
+bool melodyPlaying = false;
+bool noteSounding = false;
+int phraseEnd = 0;
+unsigned long noteStart = 0;
+unsigned long noteDur = 0;
+unsigned long nextPhraseAt = 0;
+
+// sound effects
+const int* sfxSeq = nullptr;
+int sfxSteps = 0;
+int sfxIdx = 0;
+bool sfxActive = false;
+unsigned long sfxStepStart = 0;
+
+// mood
+float confidence = CONF_START;
+unsigned long lastMood = 0;
+unsigned long lastPersonSeen = 0;
+unsigned long stillSince = 0;
+unsigned long lastHello = 0;   // 0 = never
+
+// distance
+float distHist[4] = {MAX_CM, MAX_CM, MAX_CM, MAX_CM};  // newest at [3]
+float distNow = MAX_CM;
+float approachSpeed = 0;  // cm/s, positive = getting closer
+unsigned long lastDistRead = 0;
+
+// sun sensor
+int sunCount = 0;
+bool sunOn = false;
+bool sunJustOn = false;
+int light2Raw = 0;
+
+// bee
+float beeBase = 0;
+int beeRaw = 0;
+int beeHits = 0;
+unsigned long lastBeeSample = 0;
+unsigned long lastBee = 0;     // 0 = never
+bool beePresent = false;        // true while the bee contact is currently held
+unsigned long motionProtectUntil = 0;
+bool beeWiggleActive = false;
+bool beeWigglePending = false;          // bee arrived while flower was still opening
+int beeWiggleHalfSteps = 0;             // each dip + return is two half-steps
+int currentWiggleAmount = BEE_WIGGLE_AMOUNT;
+int currentWiggleCount = BEE_WIGGLE_COUNT;
+int currentWiggleStepMs = BEE_WIGGLE_STEP_MS;
+bool comboWigglePending = false;
+
+// hiding / peeking
+unsigned long closedAt = 0;    // 0 = not fully closed yet
+int peekIdx = 0;
+unsigned long peekReachedAt = 0;
+
+// button
+bool lastButtonState = HIGH;
+unsigned long lastButtonChange = 0;
+
+unsigned long lastPrint = 0;
+
+// ---------------- Helpers ----------------
+float lerpf(float a, float b, float t) {
+  if (t < 0) t = 0;
+  if (t > 1) t = 1;
+  return a + (b - a) * t;
+}
+
+// slow for mild worry, fast for a real startle, faster still for panic
+int closeStepForSpeed(float s) {
+  if (s <= MILD_APPROACH_CM_S) return MILD_CLOSE_STEP_MS;
+  if (s < FAST_APPROACH_CM_S)
+    return (int)lerpf(MILD_CLOSE_STEP_MS, NORMAL_CLOSE_STEP_MS,
+                      (s - MILD_APPROACH_CM_S) / (FAST_APPROACH_CM_S - MILD_APPROACH_CM_S));
+  return (int)lerpf(NORMAL_CLOSE_STEP_MS, PANIC_CLOSE_STEP_MS,
+                    (s - FAST_APPROACH_CM_S) / (PANIC_APPROACH_CM_S - FAST_APPROACH_CM_S));
+}
+
+void addConfidence(float d) {
+  confidence += d;
+  if (confidence < CONF_MIN) confidence = CONF_MIN;
+  if (confidence > 1.0) confidence = 1.0;
+}
+
+// ---------------- Servo (non-blocking, slow) ----------------
+// Map logical position (CLOSED_POS..OPEN_POS) to a pulse width (CLOSED_US..OPEN_US)
+void writeServoPos(int pos) {
+  long us = CLOSED_US + (long)(OPEN_US - CLOSED_US) * (pos - CLOSED_POS) / (OPEN_POS - CLOSED_POS);
+  flower.writeMicroseconds((int)us);
+}
+
+void updateServo() {
+  if (servoPos == servoTarget) return;
+  int stepMs = (servoTarget < servoPos) ? closeStepMs : openStepMs;
+  if (millis() - lastServoStep >= (unsigned long)stepMs) {
+    lastServoStep = millis();
+    servoPos += (servoTarget > servoPos) ? 1 : -1;
+    writeServoPos(servoPos);
+  }
+}
+
+// ---------------- Melody (non-blocking, in phrases) ----------------
+int phraseNotes() {
+  return PHRASE_NOTES_MIN + (int)((PHRASE_NOTES_MAX - PHRASE_NOTES_MIN) * confidence);
+}
+
+unsigned long phraseGapMs() {
+  return (unsigned long)lerpf(GAP_TIMID_MS, GAP_BOLD_MS, confidence);
+}
+
+float currentArticulation() {
+  return lerpf(ARTIC_TIMID, ARTIC_BOLD, confidence);
+}
+
+void playCurrentNote() {
+  int divider = active->data[active->idx + 1];
+  noteDur = active->whole / abs(divider);
+  if (divider < 0) noteDur = noteDur * 3 / 2;  // dotted
+  tone(BUZZER_PIN, active->data[active->idx] * octaveMultiplier);
+  noteSounding = true;
+  noteStart = millis();
+}
+
+void stopMelody() {
+  melodyPlaying = false;
+  noteSounding = false;
+  noTone(BUZZER_PIN);
+}
+
+// Pick the song at the start of each phrase: the happy one if the sun is out.
+void startPhrase() {
+  active = sunOn ? &sun : &canon;
+  int end = active->idx + 2 * phraseNotes();
+  int total = active->count * 2;
+  phraseEnd = (end < total) ? end : total;
+  melodyPlaying = true;
+  playCurrentNote();
+}
+
+void updateMelody() {
+  if (!melodyPlaying) return;
+  unsigned long elapsed = millis() - noteStart;
+
+  if (noteSounding && elapsed >= noteDur * currentArticulation()) {
+    noTone(BUZZER_PIN);
+    noteSounding = false;
+  }
+  if (elapsed >= noteDur) {
+    active->idx += 2;
+    if (active->idx >= active->count * 2) {          // song finished
+      active->idx = 0;
+      stopMelody();
+      nextPhraseAt = LOOP_MELODY ? millis() + LOOP_PAUSE_MS : 0xFFFFFFFF;
+      return;
+    }
+    if (active->idx >= phraseEnd) {                  // phrase finished, rest a bit
+      stopMelody();
+      nextPhraseAt = millis() + phraseGapMs();
+      return;
+    }
+    playCurrentNote();
+  }
+}
+
+// ---------------- Sound effects (non-blocking) ----------------
+void applySfxStep() {
+  int f = sfxSeq[sfxIdx * 2];
+  if (f > 0) tone(BUZZER_PIN, f);
+  else noTone(BUZZER_PIN);
+}
+
+void startSfx(const int* seq, int steps) {
+  if (melodyPlaying) {              // interrupt the song; it resumes later from the same place
+    stopMelody();
+    nextPhraseAt = millis() + 1500;
+  }
+  sfxSeq = seq;
+  sfxSteps = steps;
+  sfxIdx = 0;
+  sfxActive = true;
+  sfxStepStart = millis();
+  applySfxStep();
+}
+
+void updateSfx() {
+  if (!sfxActive) return;
+  if (millis() - sfxStepStart >= (unsigned long)sfxSeq[sfxIdx * 2 + 1]) {
+    sfxIdx++;
+    if (sfxIdx >= sfxSteps) {
+      sfxActive = false;
+      noTone(BUZZER_PIN);
+    } else {
+      sfxStepStart = millis();
+      applySfxStep();
+    }
+  }
+}
+
+// ---------------- Distance / light ----------------
+float readDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, ECHO_TIMEOUT_US);
+  if (duration == 0) return MAX_CM;  // no echo = nobody close
+  float cm = duration * 0.0343 / 2.0;
+  return (cm > MAX_CM) ? MAX_CM : cm;
+}
+
+void updateSensors() {
+  if (millis() - lastDistRead >= DIST_INTERVAL_MS) {
+    lastDistRead = millis();
+    for (int i = 0; i < 3; i++) distHist[i] = distHist[i + 1];
+    distHist[3] = readDistanceCm();
+    distNow = distHist[3];
+    // compare against reading 300 ms ago
+    approachSpeed = (distHist[0] - distHist[3]) / 0.3;
+
+    // sun sensor with hysteresis: needs ~300 ms of light to turn on, fully dark to turn off
+    light2Raw = analogRead(LIGHT2_PIN);   // flip to < if reversed
+    if (light2Raw > LIGHT2_THRESHOLD) { if (sunCount < 5) sunCount++; }
+    else if (sunCount > 0) sunCount--;
+    bool was = sunOn;
+    if (!sunOn && sunCount >= 3) sunOn = true;
+    else if (sunOn && sunCount == 0) sunOn = false;
+    if (sunOn && !was) sunJustOn = true;
+  }
+}
+
+bool isBright() { return analogRead(LIGHT_PIN) > LIGHT_THRESHOLD; }  // flip to < if reversed
+
+bool isScary() {
+  // ignore dropouts (300 = no echo) so they can't fake a fast approach
+  return distNow < SCARE_RANGE_CM && distHist[0] < MAX_CM && approachSpeed > FAST_APPROACH_CM_S;
+}
+
+// a slower, closer approach: not a startle, but it makes the flower uneasy
+bool isWorried() {
+  return distNow < WORRY_RANGE_CM && distHist[0] < MAX_CM &&
+         approachSpeed > MILD_APPROACH_CM_S && approachSpeed <= FAST_APPROACH_CM_S;
+}
+
+// someone far enough away (backed off), and not moving around quickly
+bool personBackedOff() {
+  return distNow >= SAFE_DISTANCE_CM && fabs(approachSpeed) < CALM_SPEED_CM_S;
+}
+
+// ---------------- Bee ----------------
+void beeSetup() {
+#if BEE_USE_TOUCH
+  float sum = 0;
+  for (int i = 0; i < 20; i++) { sum += touchRead(BEE_PIN); delay(10); }
+  beeBase = sum / 20.0;
+#else
+  pinMode(BEE_PIN, INPUT_PULLUP);
+#endif
+}
+
+bool beeLanded() {
+  if (millis() - lastBeeSample < 50) return false;
+  lastBeeSample = millis();
+#if BEE_USE_TOUCH
+  beeRaw = touchRead(BEE_PIN);
+  bool hit = fabs((float)beeRaw - beeBase) > beeBase * BEE_TOUCH_FRACTION;
+  if (!hit) beeBase += ((float)beeRaw - beeBase) * 0.02;   // follow slow drift
+#else
+  beeRaw = digitalRead(BEE_PIN);
+  bool hit = (beeRaw == LOW);
+#endif
+  beePresent = hit;
+  if (hit) beeHits++; else beeHits = 0;
+  if (beeHits == BEE_HITS_NEEDED && (lastBee == 0 || millis() - lastBee >= BEE_COOLDOWN_MS)) {
+    lastBee = millis();
+    return true;
+  }
+  return false;
+}
+
+// ---------------- Mood (confidence + hello) ----------------
+void updateMood() {
+  if (millis() - lastMood < 100) return;
+  lastMood = millis();
+  const float dt = 0.1;
+
+  bool near = distNow < SCARE_RANGE_CM;
+  bool calm = fabs(approachSpeed) < CALM_SPEED_CM_S;
+  float before = confidence;
+
+  if (near) {
+    lastPersonSeen = millis();
+    if (calm && state == AWAKE) addConfidence(CONF_RISE_PER_S * dt);   // bolder with calm company
+  } else if (millis() - lastPersonSeen > ALONE_GRACE_MS) {
+    addConfidence(-CONF_FALL_PER_S * dt);                              // lonely -> timid again
+  }
+
+  if (state != AWAKE) { stillSince = 0; return; }
+
+  if (before < CONF_PROUD && confidence >= CONF_PROUD) PLAY_SFX(SFX_CHIRP);
+
+  // Someone standing still at a respectful distance: invite them in.
+  if (distNow >= SAFE_DISTANCE_CM && distNow < HELLO_MAX_CM && fabs(approachSpeed) < HELLO_STILL_CM_S) {
+    if (stillSince == 0) stillSince = millis();
+    if (millis() - stillSince >= HELLO_AFTER_MS &&
+        (lastHello == 0 || millis() - lastHello >= HELLO_COOLDOWN_MS) &&
+        !melodyPlaying && !sfxActive) {
+      PLAY_SFX(SFX_HELLO);
+      lastHello = millis();
+    }
+  } else {
+    stillSince = 0;
+  }
+}
+
+// ---------------- State changes ----------------
+// speed = how fast the person approached (cm/s); 0 = gentle retreat
+void goHide(float speed) {
+  bool startle = speed >= FAST_APPROACH_CM_S;
+  if (melodyPlaying) {   // remember where we were, back up a little so it resumes musically
+    active->idx -= 2 * RESUME_BACKUP_NOTES;
+    if (active->idx < 0) active->idx = 0;
+  }
+  stopMelody();
+  closeStepMs = closeStepForSpeed(speed);
+  servoTarget = CLOSED_POS;
+  closedAt = (servoPos == CLOSED_POS) ? millis() : 0;
+  state = HIDING;
+  addConfidence(startle ? -0.30 : -0.10);
+  if (startle) PLAY_SFX(SFX_SQUEAK);
+  else PLAY_SFX(SFX_WORRY);
+  Serial.print(">> ");
+  Serial.print(startle ? "Scared!" : "Worried.");
+  Serial.print(" Hiding, close step ms=");
+  Serial.println(closeStepMs);
+}
+
+void goPeek() {
+  state = PEEKING;
+  peekIdx = 0;
+  peekReachedAt = 0;
+  openStepMs = PEEK_OPEN_STEP_MS;
+  closeStepMs = PEEK_CLOSE_STEP_MS;
+  servoTarget = PEEK_POS[0];
+  PLAY_SFX(SFX_PEEK);
+  Serial.println(">> Peeking...");
+}
+
+void goWake(bool chirp) {
+  openStepMs = OPEN_STEP_MS;
+  closeStepMs = CLOSE_STEP_MS;
+  servoTarget = OPEN_POS;
+  nextPhraseAt = millis() + 700;   // let the chirp finish first
+  state = AWAKE;
+  stillSince = 0;
+  protectMotion(WAKE_SETTLE_MS);
+  resetMotionHistory();
+  if (chirp) PLAY_SFX(SFX_CHIRP);
+  Serial.println(">> Coming out.");
+}
+
+void goSleep() {
+  stopMelody();
+  closeStepMs = SLEEP_CLOSE_STEP_MS;
+  servoTarget = CLOSED_POS;
+  state = SLEEPING;
+  PLAY_SFX(SFX_SLEEP);
+  Serial.println(">> Button: closing for the end.");
+}
+
+bool motionProtected() {
+  return (long)(motionProtectUntil - millis()) > 0;
+}
+
+void protectMotion(unsigned long ms) {
+  unsigned long until = millis() + ms;
+  if ((long)(until - motionProtectUntil) > 0) motionProtectUntil = until;
+}
+
+// Throw away stale ultrasonic history whenever something deterministically wakes
+// the flower. This prevents an old far reading + a new near reading from looking
+// like an impossibly fast approach immediately after opening.
+void resetMotionHistory() {
+  float d = readDistanceCm();
+  distNow = d;
+  for (int i = 0; i < 4; i++) distHist[i] = d;
+  approachSpeed = 0;
+  lastDistRead = millis();
+}
+
+void startWiggle(int amount, int count, int stepMs) {
+  beeWiggleActive = true;
+  beeWiggleHalfSteps = 0;
+  currentWiggleAmount = amount;
+  currentWiggleCount = count;
+  currentWiggleStepMs = stepMs;
+  openStepMs = currentWiggleStepMs;
+  closeStepMs = currentWiggleStepMs;
+  servoTarget = OPEN_POS - currentWiggleAmount;
+}
+
+void startBeeWiggle() {
+  startWiggle(BEE_WIGGLE_AMOUNT, BEE_WIGGLE_COUNT, BEE_WIGGLE_STEP_MS);
+}
+
+void startBeeSunWiggle() {
+  startWiggle(BEE_SUN_WIGGLE_AMOUNT, BEE_SUN_WIGGLE_COUNT, BEE_SUN_WIGGLE_STEP_MS);
+}
+
+void updateBeeWiggle() {
+  if (!beeWiggleActive) return;
+  if (servoPos != servoTarget) return;
+
+  beeWiggleHalfSteps++;
+  if (beeWiggleHalfSteps >= currentWiggleCount * 2) {
+    beeWiggleActive = false;
+    openStepMs = OPEN_STEP_MS;
+    closeStepMs = CLOSE_STEP_MS;
+    servoTarget = OPEN_POS;
+    return;
+  }
+
+  // Alternate between a small dip and fully open.
+  servoTarget = (servoTarget == OPEN_POS)
+                  ? OPEN_POS - currentWiggleAmount
+                  : OPEN_POS;
+}
+
+bool sunActiveNow() {
+  return sunOn || isBright();
+}
+
+void beeSunCelebration() {
+  Serial.println(">> BEE + SUN! Celebration mode!");
+  addConfidence(0.45);
+  protectMotion(BEE_SUN_PROTECT_MS);
+  resetMotionHistory();
+
+  state = AWAKE;
+  openStepMs = OPEN_STEP_MS;
+  closeStepMs = CLOSE_STEP_MS;
+  servoTarget = OPEN_POS;
+  closedAt = 0;
+  stillSince = 0;
+
+  // Unique song blocks the normal melody while the celebration happens.
+  PLAY_SFX(SFX_BEE_SUN);
+  nextPhraseAt = millis() + 2600;
+
+  // Celebrate whether already open or still opening. If still opening, queue it.
+  if (servoPos == OPEN_POS) startBeeSunWiggle();
+  else comboWigglePending = true;
+}
+
+void beeReaction() {
+  // If the flower is in sun when the bee arrives, use the special combined state.
+  if (sunActiveNow()) {
+    beeSunCelebration();
+    return;
+  }
+
+  Serial.println(">> A bee! Friend! Bee has priority.");
+  addConfidence(0.30);
+
+  // A bee is deterministic: it wins over ultrasonic motion for several seconds.
+  protectMotion(BEE_PROTECT_MS);
+  resetMotionHistory();
+
+  // If the bee arrives while the flower is already awake (fully open OR still
+  // opening), celebrate. If it is still opening, queue the wiggle until OPEN_POS.
+  bool wasOpenOrOpening = (state == AWAKE);
+
+  state = AWAKE;
+  openStepMs = OPEN_STEP_MS;
+  closeStepMs = CLOSE_STEP_MS;
+  servoTarget = OPEN_POS;
+  closedAt = 0;
+  stillSince = 0;
+
+  PLAY_SFX(SFX_BEE);
+  nextPhraseAt = millis() + 1800;
+
+  if (wasOpenOrOpening) {
+    if (servoPos == OPEN_POS) startBeeWiggle();
+    else beeWigglePending = true;
+  }
+}
+
+void lightWakeReaction() {
+  Serial.println(">> Bright light! Waking with priority.");
+  addConfidence(0.15);
+  protectMotion(LIGHT_PROTECT_MS);
+  resetMotionHistory();
+
+  state = AWAKE;
+  openStepMs = OPEN_STEP_MS;
+  closeStepMs = CLOSE_STEP_MS;
+  servoTarget = OPEN_POS;
+  closedAt = 0;
+  stillSince = 0;
+
+  PLAY_SFX(SFX_CHIRP);
+  nextPhraseAt = millis() + 1200;
+}
+
+// ---------------- Button ----------------
+bool buttonPressed() {
+  bool reading = digitalRead(BUTTON_PIN);
+  bool pressed = false;
+  if (reading != lastButtonState && millis() - lastButtonChange > 50) {
+    lastButtonChange = millis();
+    lastButtonState = reading;
+    if (reading == LOW) pressed = true;
+  }
+  return pressed;
+}
+
+// ---------------- Arduino ----------------
+void setup() {
+  Serial.begin(9600);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(TRIG_PIN, LOW);
+  beeSetup();   // keep hands off the copper tape during the first ~200 ms
+
+  flower.attach(SERVO_PIN, 500, 2500);   // allowed pulse range; 700-1100 sits inside it
+  writeServoPos(CLOSED_POS);
+  servoPos = CLOSED_POS;
+  delay(500);
+
+  goWake(true);  // start open if nobody's around
+}
+
+void loop() {
+  updateSensors();
+  updateMood();
+  updateServo();
+  updateBeeWiggle();
+  if (comboWigglePending && !beeWiggleActive && servoPos == OPEN_POS) {
+    comboWigglePending = false;
+    beeWigglePending = false;
+    startBeeSunWiggle();
+  } else if (beeWigglePending && !beeWiggleActive && servoPos == OPEN_POS) {
+    beeWigglePending = false;
+    startBeeWiggle();
+  }
+  updateMelody();
+  updateSfx();
+
+  bool sunEdge = sunJustOn;
+  sunJustOn = false;
+  bool bee = beeLanded();
+
+  // Button: toggles between "the end" and waking back up
+  if (buttonPressed()) {
+    if (state == SLEEPING) goWake(true);
+    else goSleep();
+  }
+
+  bool comboHandledThisLoop = false;
+  if (bee && state != SLEEPING) {
+    comboHandledThisLoop = sunActiveNow();
+    beeReaction();
+  }
+  // If sunlight arrives while the bee is already touching the flower, trigger the
+  // combined celebration too. Otherwise sunlight performs its normal wake.
+  if (sunEdge && state != SLEEPING) {
+    if (beePresent && !comboHandledThisLoop) beeSunCelebration();
+    else if (!beePresent) lightWakeReaction();
+  }
+
+  switch (state) {
+    case AWAKE:
+      // Only APPROACH SPEED can scare it, and never during the bee-priority window.
+      // Bright light is also an active priority condition: while either light
+      // sensor says bright, ultrasonic movement cannot close the flower.
+      if (!motionProtected() && !sunOn && !isBright() && (isScary() || isWorried())) {
+        goHide(approachSpeed);
+        break;
+      }
+      // sing a phrase once fully open (and no sound effect is playing)
+      if (!melodyPlaying && !sfxActive && !beeWiggleActive &&
+          servoPos == OPEN_POS && millis() >= nextPhraseAt) {
+        startPhrase();
+      }
+      break;
+
+    case HIDING:
+      // Either photoresistor can deterministically wake the flower immediately.
+      // No need to wait 5 s and movement cannot instantly undo this wake.
+      if (sunOn || isBright()) {
+        lightWakeReaction();
+        break;
+      }
+
+      // start the 5 s timer once fully closed; restart it if scared again
+      if (servoPos == CLOSED_POS && closedAt == 0) closedAt = millis();
+      if (!motionProtected() && isScary() && servoPos == CLOSED_POS) closedAt = millis();
+
+      if (closedAt != 0 && millis() - closedAt >= MIN_CLOSED_MS) {
+        if (personBackedOff()) goPeek();
+      }
+      break;
+
+    case PEEKING:
+      if (sunOn || isBright()) {
+        lightWakeReaction();
+        break;
+      }
+      // Do not close just because something is physically close. Only a
+      // sufficiently fast approach can scare it.
+      if (!motionProtected() && (isScary() || isWorried())) {
+        goHide(approachSpeed);
+        break;
+      }
+      if (servoPos == servoTarget) {
+        if (peekReachedAt == 0) {
+          peekReachedAt = millis();
+        } else if (millis() - peekReachedAt >= PEEK_PAUSE_MS) {
+          peekIdx++;
+          peekReachedAt = 0;
+          if (peekIdx >= PEEK_COUNT) {
+            goWake(true);                              // coast is clear
+          } else {
+            servoTarget = PEEK_POS[peekIdx];
+            if (servoTarget > servoPos) PLAY_SFX(SFX_PEEK);
+          }
+        }
+      }
+      break;
+
+    case SLEEPING:
+      // closed and done; waiting for button
+      break;
+  }
+
+  // debug output twice a second
+  if (millis() - lastPrint > 500) {
+    lastPrint = millis();
+    Serial.print("state=");
+    Serial.print(state == AWAKE ? "AWAKE" : state == HIDING ? "HIDING" : state == PEEKING ? "PEEKING" : "SLEEPING");
+    Serial.print(" dist=");
+    Serial.print(distNow, 0);
+    Serial.print("cm speed=");
+    Serial.print(approachSpeed, 0);
+    Serial.print("cm/s light=");
+    Serial.print(analogRead(LIGHT_PIN));
+    Serial.print(" sun=");
+    Serial.print(light2Raw);
+    Serial.print(sunOn ? "(ON)" : "(off)");
+    Serial.print(" conf=");
+    Serial.print(confidence, 2);
+    Serial.print(" bee=");
+    Serial.println(beeRaw);
+  }
+}
